@@ -1,156 +1,108 @@
-import 'dart:convert';
 import 'dart:io';
 
-import 'package:args/args.dart';
-import 'package:dart_tui/dart_tui.dart';
-import 'package:nemotron_bot/inference.dart';
-import 'package:nemotron_bot/session.dart';
-import 'package:nemotron_bot/tui/app.dart';
-import 'package:nemotron_bot/tui/model.dart';
-import 'package:nemotron_bot/tui/update.dart';
+import 'package:llamadart/llamadart.dart';
 import 'package:path/path.dart' as p;
 
-const _defaultSystemPrompt = 'You are a concise, highly capable terminal assistant.';
+/// Known model files, tried in order when no `--model` flag is given.
+const _defaultModelCandidates = <String>[
+  'models/Qwen3.5-4B-UD-Q5_K_XL.gguf',
+  'models/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf',
+];
 
-String _resolveDefaultModelPath(String currentDir) {
-  final candidates = <String>[
-    p.join(currentDir, 'models', 'NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf'),
-    p.join(currentDir, 'models', 'Qwen3.5-4B-UD-Q5_K_XL.gguf'),
-  ];
+const _systemPrompt = 'You are a concise and highly capable Linux terminal assistant.';
 
-  for (final candidate in candidates) {
-    if (File(candidate).existsSync()) return candidate;
-  }
+void main(List<String> arguments) async {
+  final modelPath = _resolveModelPath(arguments);
 
-  return candidates.first;
-}
-
-ArgParser _buildParser() {
-  return ArgParser()
-    ..addFlag('help', abbr: 'h', negatable: false, help: 'Show usage information.')
-    ..addOption('model', help: 'Path to a GGUF model file.')
-    ..addOption('prompt', help: 'Override the system prompt.')
-    ..addOption('load-session', help: 'Load a saved conversation from JSON.')
-    ..addOption('save-session', help: 'Persist the conversation to JSON on exit.');
-}
-
-Future<void> main(List<String> arguments) async {
-  final parser = _buildParser();
-  final results = parser.parse(arguments);
-
-  if (results['help'] as bool) {
-    stdout.writeln('Nemotron Bot — Terminal AI Chat');
-    stdout.writeln(parser.usage);
-    return;
-  }
-
-  final currentDir = Directory.current.path;
-  final modelPath = p.normalize(
-    results['model']?.toString().trim().isNotEmpty == true
-        ? results['model'].toString().trim()
-        : _resolveDefaultModelPath(currentDir),
-  );
-  final modelFile = File(modelPath);
-  final saveSessionPath = results['save-session']?.toString().trim();
-  final loadSessionPath = results['load-session']?.toString().trim();
-  final promptOverride = results['prompt']?.toString().trim();
-
-  stderr.writeln('Nemotron Bot — Terminal AI Chat');
-  stderr.writeln('Model path: ${modelFile.absolute.path}');
-
-  if (!modelFile.existsSync()) {
-    stderr.writeln('ERROR: Model file not found at ${modelFile.absolute.path}');
-    stderr.writeln('Download a GGUF model or use --model <path>.');
+  if (!File(modelPath).existsSync()) {
+    stderr.writeln('ERROR: Model file not found at ${p.absolute(modelPath)}');
+    stderr.writeln('Download a GGUF model into models/ or pass --model <path>.');
     exit(1);
   }
 
-  // Load or create conversation session
-  final conversation = loadSessionPath == null
-      ? ConversationSession(systemPrompt: promptOverride ?? _defaultSystemPrompt)
-      : await ConversationSession.loadFromFile(
-          loadSessionPath,
-          fallbackSystemPrompt: promptOverride ?? _defaultSystemPrompt,
-        );
+  stderr.writeln('Loading model: ${p.basename(modelPath)} (this can take 10-30s)...');
 
-  if (promptOverride != null && promptOverride.isNotEmpty) {
-    conversation.systemPrompt = promptOverride;
-  }
+  final backend = LlamaBackend();
+  final engine = LlamaEngine(backend);
+  final session = ChatSession(engine, systemPrompt: _systemPrompt);
+  var generating = false;
+  var quit = false;
 
-  // Load the model
-  stderr.writeln('Loading model into RAM (10-30s)...');
-  final inference = NemotronInference(
-    modelPath: modelPath,
-    conversation: conversation,
-    systemPrompt: conversation.systemPrompt,
-  );
+  // Ctrl+C cancels the current generation; a second press quits.
+  final sigintSub = ProcessSignal.sigint.watch().listen((_) {
+    if (generating) {
+      engine.cancelGeneration();
+      stdout.writeln('\n[interrupted]');
+    } else {
+      quit = true;
+      stdout.writeln();
+    }
+  });
 
   try {
-    await inference.loadModel();
-  } catch (e) {
-    stderr.writeln('ERROR loading model: $e');
-    exit(1);
+    await engine.setNativeLogLevel(LlamaLogLevel.warn);
+    await engine.loadModel(modelPath);
+
+    stderr.writeln('Ready. Type a message (or /exit to quit).');
+
+    while (!quit) {
+      stdout.write('> ');
+      final input = stdin.readLineSync();
+      if (input == null) break; // EOF (e.g. Ctrl+D)
+
+      final prompt = input.trim();
+      if (prompt.isEmpty) continue;
+
+      if (prompt == '/exit' || prompt == '/quit') break;
+      if (prompt == '/clear') {
+        session.reset();
+        stdout.writeln('[conversation cleared]');
+        continue;
+      }
+      if (prompt == '/help') {
+        stdout.writeln('Commands: /exit, /quit, /clear, /help');
+        continue;
+      }
+
+      generating = true;
+      try {
+        await for (final chunk
+            in session.create([LlamaTextContent(prompt)])) {
+          final content = chunk.choices.first.delta.content;
+          if (content != null && content.isNotEmpty) {
+            stdout.write(content);
+            stdout.flush(); // Stream tokens in real time.
+          }
+        }
+        stdout.writeln();
+      } catch (e) {
+        stderr.writeln('\nERROR: $e');
+      } finally {
+        generating = false;
+      }
+    }
+  } catch (e, st) {
+    stderr.writeln('\nERROR: $e');
+    stderr.writeln(st);
+  } finally {
+    await sigintSub.cancel();
+    await engine.dispose();
+    stderr.writeln('Goodbye.');
   }
-
-  stderr.writeln('Model loaded. Starting TUI...');
-
-  // Register inference with the update module
-  registerInference(inference);
-
-  // Build initial state from existing conversation
-  final initialMessages = conversation.turns.map((turn) {
-    return ChatMessage(role: turn.role, content: turn.content);
-  }).toList();
-
-  final initialState = NemotronState(
-    conversation: conversation,
-    messages: initialMessages,
-    modelLoaded: true,
-    statusMessage: '',
-  );
-
-  // Start the TUI
-  final appModel = NemotronAppModel(initialState);
-
-  await Program(
-    options: const ProgramOptions(
-      altScreen: true,
-      hideCursor: false,
-    ),
-    programOptions: [
-      withMouseCellMotion(),
-      withFps(60),
-      withReportFocus(),
-    ],
-  ).run(appModel);
-
-  // Cleanup
-  _cleanup(inference, conversation, saveSessionPath);
 }
 
-void _cleanup(
-  NemotronInference inference,
-  ConversationSession conversation,
-  String? saveSessionPath,
-) {
-  // Restore terminal
-  stdout.writeln('');
-
-  if (saveSessionPath != null && saveSessionPath.isNotEmpty) {
-    try {
-      final file = File(saveSessionPath);
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(
-        const JsonEncoder.withIndent('  ').convert(conversation.toJson()),
-      );
-      stderr.writeln('Session saved to $saveSessionPath');
-    } catch (e) {
-      stderr.writeln('Failed to save session: $e');
+/// Returns the model path from `--model <path>` or auto-detects one.
+String _resolveModelPath(List<String> arguments) {
+  for (var i = 0; i < arguments.length - 1; i++) {
+    if (arguments[i] == '--model' || arguments[i] == '-m') {
+      final value = arguments[i + 1].trim();
+      if (value.isNotEmpty) return p.normalize(value);
     }
   }
 
-  try {
-    inference.dispose();
-  } catch (_) {}
+  for (final candidate in _defaultModelCandidates) {
+    if (File(candidate).existsSync()) return p.normalize(candidate);
+  }
 
-  stderr.writeln('Goodbye.');
+  return p.normalize(_defaultModelCandidates.first);
 }
